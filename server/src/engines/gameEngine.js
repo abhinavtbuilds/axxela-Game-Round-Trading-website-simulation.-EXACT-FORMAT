@@ -88,14 +88,15 @@ export class GameEngine {
 
   /**
    * Fills remaining empty seats up to maxPlayers with AI bots.
+   * Phase 2: uses BotEngine.assignPersonalities with seeded RNG.
    */
   fillEmptySeatsWithBots() {
-    let personalityIndex = 0;
-    while (this.players.length < this.maxPlayers) {
-      const assignedLetter = PLAYER_LETTERS[this.players.length];
-      const botType = BotEngine.PERSONALITIES[personalityIndex % BotEngine.PERSONALITIES.length];
-      personalityIndex++;
+    const humanCount = this.players.length;
+    const botCount = this.maxPlayers - humanCount;
+    const types = this.botEngine.assignPersonalities(botCount);
 
+    for (const botType of types) {
+      const assignedLetter = PLAYER_LETTERS[this.players.length];
       const bot = {
         id: `bot-${assignedLetter.toLowerCase()}-${randomUUID().substring(0, 6)}`,
         letter: assignedLetter,
@@ -186,37 +187,43 @@ export class GameEngine {
    *     the bot's noisyEV by at least its personality's minimum edge,
    *     provided the bot has room under ±2.
    * (b) Otherwise, if < 2 own orders, post one quote around noisyEV
-   *     with the personality-appropriate spread. Never post two
-   *     identical quotes on the same side.
+   *     with the personality-appropriate spread.  Never post two
+   *     quotes on the same side — cancel/replace instead.
    * (c) Cancel own stale orders after a digit reveal or randomly.
    */
   executeBotTick(bot) {
-    const revealedDigits = this.digitEngine.getRevealedDigitsForRound(
-      this.roundManager.currentRound, false
-    );
+    const currentRound = this.roundManager.currentRound;
+    const revealedDigits = this.digitEngine.getRevealedDigitsForRound(currentRound, false);
+
+    // ── SLOW_REACTOR: skip tick during post-reveal delay ─────────
+    if (this.botEngine.isBotDelayed(bot, revealedDigits)) return;
 
     // ── (a) Look for orders to TAKE ──────────────────────────────
     const openOrders = this.tradeEngine.getAllOpenWorkingOrders()
       .filter(o => o.playerId !== bot.id);
     const minEdge = this.botEngine.getMinEdge(bot);
     const noisyEV = this.botEngine.getNoisyEV(bot, revealedDigits);
+    const unwinding = this.botEngine.isUnwinding(bot, currentRound);
+    const currentPosition = this.positionEngine.getPosition(bot.id);
 
-    // Find the best order: highest BUY price (we sell) or lowest SELL price (we buy)
     let bestOrder = null;
     let bestScore = -Infinity;
 
     for (const order of openOrders) {
       if (order.side === 'BUY' && this.positionEngine.canSell(bot.id, 1)) {
-        // Maker wants to BUY — bot would SELL. Edge = price - noisyEV.
+        // Maker wants to BUY — bot would SELL.
         const edge = order.price - noisyEV;
-        if (edge >= minEdge && edge > bestScore) {
+        // FORCED_UNWINDER: if long, any sell reduces position — accept without edge
+        const effectiveMin = (unwinding && currentPosition > 0) ? -999 : minEdge;
+        if (edge >= effectiveMin && edge > bestScore) {
           bestScore = edge;
           bestOrder = order;
         }
       } else if (order.side === 'SELL' && this.positionEngine.canBuy(bot.id, 1)) {
-        // Maker wants to SELL — bot would BUY. Edge = noisyEV - price.
+        // Maker wants to SELL — bot would BUY.
         const edge = noisyEV - order.price;
-        if (edge >= minEdge && edge > bestScore) {
+        const effectiveMin = (unwinding && currentPosition < 0) ? -999 : minEdge;
+        if (edge >= effectiveMin && edge > bestScore) {
           bestScore = edge;
           bestOrder = order;
         }
@@ -227,7 +234,7 @@ export class GameEngine {
       try {
         const res = this.tradeEngine.takeWorkingOrder(bestOrder.id, bot.id, bot.letter);
         this.broadcastTradeExecution(res);
-        return; // Tick ends — don't post and take in the same tick
+        return;
       } catch (e) {
         // Order might have been taken by someone else; continue to quote
       }
@@ -236,8 +243,18 @@ export class GameEngine {
     // ── (b) Post a quote if we have room ─────────────────────────
     const botOrdersCount = this.tradeEngine.getActiveWorkingOrdersCount(bot.id);
     if (botOrdersCount < 2 && Math.random() < this.botEngine.getQuoteProb(bot)) {
-      const side = this.botEngine.pickQuoteSide(bot);
+      const side = this.botEngine.pickQuoteSide(bot, currentRound);
       if (side) {
+        // Cancel any existing order on the same side first (replace, never two on one side)
+        const myOrders = this.tradeEngine.getWorkingOrdersForPlayer(bot.id);
+        const sameSideOrder = myOrders.find(o => o.side === side);
+        if (sameSideOrder) {
+          try {
+            this.tradeEngine.cancelWorkingOrder(sameSideOrder.id, bot.id);
+            this.emitEvent('order:cancelled', { orderId: sameSideOrder.id });
+          } catch (e) { /* ignore */ }
+        }
+
         const price = this.botEngine.generateQuotePrice(bot, side, noisyEV);
         if (price >= 0 && price <= 54) {
           try {
@@ -246,7 +263,7 @@ export class GameEngine {
               playerLetter: bot.letter,
               side,
               price,
-              round: this.roundManager.currentRound
+              round: currentRound
             });
             this.emitEvent('order:created', { order });
           } catch (e) {
