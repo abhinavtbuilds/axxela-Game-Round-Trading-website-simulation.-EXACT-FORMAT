@@ -68,10 +68,13 @@ export class RoundManager {
 
         if (this.timeRemaining <= 0) {
           this.stopTimer();
+          // startRound BEFORE onTransitionEnd so broadcastRoomState
+          // (triggered by game:roundStart) reads the updated currentRound
+          const nextRound = this.currentRound + 1;
+          this.startRound(nextRound);
           this.onTransitionEnd({
-            nextRound: this.currentRound + 1
+            nextRound: this.currentRound
           });
-          this.startRound(this.currentRound + 1);
         }
       }, 1000);
     } else {

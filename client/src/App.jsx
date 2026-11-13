@@ -153,6 +153,26 @@ export default function App() {
       setShowReplay(false);
     }
 
+    function onOrderCreated(data) {
+      setGameState(prev => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          openTableOrders: [...(prev.openTableOrders || []), data.order]
+        };
+      });
+    }
+
+    function onOrderCancelled(data) {
+      setGameState(prev => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          openTableOrders: (prev.openTableOrders || []).filter(o => o.id !== data.orderId)
+        };
+      });
+    }
+
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
     socket.on('room:created', onRoomCreated);
@@ -164,6 +184,8 @@ export default function App() {
     socket.on('trade:executed', onTradeExecuted);
     socket.on('game:settlement', onSettlement);
     socket.on('game:reset', onGameReset);
+    socket.on('order:created', onOrderCreated);
+    socket.on('order:cancelled', onOrderCancelled);
 
     if (socket.connected) onConnect();
 
@@ -179,6 +201,8 @@ export default function App() {
       socket.off('trade:executed', onTradeExecuted);
       socket.off('game:settlement', onSettlement);
       socket.off('game:reset', onGameReset);
+      socket.off('order:created', onOrderCreated);
+      socket.off('order:cancelled', onOrderCancelled);
     };
   }, []);
 
