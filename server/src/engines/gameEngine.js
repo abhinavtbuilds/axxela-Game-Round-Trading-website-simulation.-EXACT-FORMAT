@@ -44,6 +44,7 @@ export class GameEngine {
     this.status = 'LOBBY'; // LOBBY, INSTRUCTIONS, TRADING, TRANSITION, SETTLEMENT, FINISHED
     this.settlementResults = null;
     this.botActivityInterval = null;
+    this.botIntervals = new Map(); // playerId -> intervalId (Phase 1: per-bot timers)
 
     // Callbacks to notify socket layer
     this.emitEvent = options.emitEvent || (() => {});
@@ -145,91 +146,126 @@ export class GameEngine {
 
   /**
    * Background loop for bot trade participation and market quoting.
+   * Phase 1: Each bot gets its own timer with a random 2-6 s delay.
    */
   startBotActivityLoop() {
-    if (this.botActivityInterval) clearInterval(this.botActivityInterval);
+    // Clear any existing intervals
+    this.stopBotActivityLoop();
 
-    this.botActivityInterval = setInterval(() => {
-      if (this.status !== 'TRADING') return;
+    const bots = this.players.filter(p => p.isBot);
+    for (const bot of bots) {
+      const delayMs = 2000 + Math.floor(Math.random() * 4001); // 2000-6000 ms
+      const intervalId = setInterval(() => {
+        if (this.status !== 'TRADING') return;
+        this.executeBotTick(bot);
+      }, delayMs);
+      this.botIntervals.set(bot.id, intervalId);
+    }
+  }
 
-      const revealedDigits = this.digitEngine.getRevealedDigitsForRound(this.roundManager.currentRound, false);
-      const ev = this.digitEngine.getExpectedValue(this.roundManager.currentRound, false).expectedValue;
-      const bots = this.players.filter(p => p.isBot);
-      if (bots.length === 0) return;
+  /**
+   * Clears all per-bot timer intervals.
+   */
+  stopBotActivityLoop() {
+    for (const [id, intervalId] of this.botIntervals) {
+      clearInterval(intervalId);
+    }
+    this.botIntervals.clear();
+    // Also clear the old single-interval reference in case anything still holds it
+    if (this.botActivityInterval) {
+      clearInterval(this.botActivityInterval);
+      this.botActivityInterval = null;
+    }
+  }
 
-      const randomBot = bots[Math.floor(Math.random() * bots.length)];
+  /**
+   * Executes one tick of activity for a single bot using its private
+   * noisy fair-value belief so that quotes from different bots can cross.
+   *
+   * (a) Look at open orders from others → TAKE the best one that beats
+   *     the bot's noisyEV by at least its personality's minimum edge,
+   *     provided the bot has room under ±2.
+   * (b) Otherwise, if < 2 own orders, post one quote around noisyEV
+   *     with the personality-appropriate spread. Never post two
+   *     identical quotes on the same side.
+   * (c) Cancel own stale orders after a digit reveal or randomly.
+   */
+  executeBotTick(bot) {
+    const revealedDigits = this.digitEngine.getRevealedDigitsForRound(
+      this.roundManager.currentRound, false
+    );
 
-      // 1. First check if there's any attractive open table order from someone else to TAKE!
-      const openOrders = this.tradeEngine.getAllOpenWorkingOrders().filter(o => o.playerId !== randomBot.id);
-      let tookOrder = false;
+    // ── (a) Look for orders to TAKE ──────────────────────────────
+    const openOrders = this.tradeEngine.getAllOpenWorkingOrders()
+      .filter(o => o.playerId !== bot.id);
+    const minEdge = this.botEngine.getMinEdge(bot);
+    const noisyEV = this.botEngine.getNoisyEV(bot, revealedDigits);
 
-      for (const order of openOrders) {
-        // If order is BUY @ P, maker wants to buy. Bot would SELL. Attractive if P >= ev
-        if (order.side === 'BUY' && this.positionEngine.canSell(randomBot.id, 1)) {
-          if (order.price >= ev) {
-            try {
-              const res = this.tradeEngine.takeWorkingOrder(order.id, randomBot.id, randomBot.letter);
-              this.broadcastTradeExecution(res);
-              tookOrder = true;
-              break;
-            } catch (e) {}
-          }
+    // Find the best order: highest BUY price (we sell) or lowest SELL price (we buy)
+    let bestOrder = null;
+    let bestScore = -Infinity;
+
+    for (const order of openOrders) {
+      if (order.side === 'BUY' && this.positionEngine.canSell(bot.id, 1)) {
+        // Maker wants to BUY — bot would SELL. Edge = price - noisyEV.
+        const edge = order.price - noisyEV;
+        if (edge >= minEdge && edge > bestScore) {
+          bestScore = edge;
+          bestOrder = order;
         }
-        // If order is SELL @ P, maker wants to sell. Bot would BUY. Attractive if P <= ev
-        else if (order.side === 'SELL' && this.positionEngine.canBuy(randomBot.id, 1)) {
-          if (order.price <= ev) {
-            try {
-              const res = this.tradeEngine.takeWorkingOrder(order.id, randomBot.id, randomBot.letter);
-              this.broadcastTradeExecution(res);
-              tookOrder = true;
-              break;
-            } catch (e) {}
+      } else if (order.side === 'SELL' && this.positionEngine.canBuy(bot.id, 1)) {
+        // Maker wants to SELL — bot would BUY. Edge = noisyEV - price.
+        const edge = noisyEV - order.price;
+        if (edge >= minEdge && edge > bestScore) {
+          bestScore = edge;
+          bestOrder = order;
+        }
+      }
+    }
+
+    if (bestOrder) {
+      try {
+        const res = this.tradeEngine.takeWorkingOrder(bestOrder.id, bot.id, bot.letter);
+        this.broadcastTradeExecution(res);
+        return; // Tick ends — don't post and take in the same tick
+      } catch (e) {
+        // Order might have been taken by someone else; continue to quote
+      }
+    }
+
+    // ── (b) Post a quote if we have room ─────────────────────────
+    const botOrdersCount = this.tradeEngine.getActiveWorkingOrdersCount(bot.id);
+    if (botOrdersCount < 2 && Math.random() < this.botEngine.getQuoteProb(bot)) {
+      const side = this.botEngine.pickQuoteSide(bot);
+      if (side) {
+        const price = this.botEngine.generateQuotePrice(bot, side, noisyEV);
+        if (price >= 0 && price <= 54) {
+          try {
+            const order = this.tradeEngine.createWorkingOrder({
+              playerId: bot.id,
+              playerLetter: bot.letter,
+              side,
+              price,
+              round: this.roundManager.currentRound
+            });
+            this.emitEvent('order:created', { order });
+          } catch (e) {
+            // Position limit or order limit hit — skip silently
           }
         }
       }
+    }
 
-      if (tookOrder) return;
-
-      // 2. If bot has < 2 working orders, quote an attractive or competitive order!
-      const botOrdersCount = this.tradeEngine.getActiveWorkingOrdersCount(randomBot.id);
-      if (botOrdersCount < 2 && Math.random() < 0.7) {
-        const canBuy = this.positionEngine.canBuy(randomBot.id, 1);
-        const canSell = this.positionEngine.canSell(randomBot.id, 1);
-        if (!canBuy && !canSell) return;
-
-        let side = 'BUY';
-        if (canBuy && !canSell) side = 'BUY';
-        else if (!canBuy && canSell) side = 'SELL';
-        else side = Math.random() < 0.5 ? 'BUY' : 'SELL';
-
-        // Calculate price with small spread around EV
-        const offset = Math.floor(Math.random() * 4) + 1; // 1 to 4
-        let price = side === 'BUY' ? Math.round(ev - offset) : Math.round(ev + offset);
-        price = Math.max(1, Math.min(54, price));
-
+    // ── (c) Cancel stale orders ──────────────────────────────────
+    if (Math.random() < this.botEngine.getCancelProb(bot)) {
+      const myOrders = this.tradeEngine.getWorkingOrdersForPlayer(bot.id);
+      if (myOrders.length > 0 && Date.now() - myOrders[0].createdAt > 12000) {
         try {
-          const order = this.tradeEngine.createWorkingOrder({
-            playerId: randomBot.id,
-            playerLetter: randomBot.letter,
-            side,
-            price,
-            round: this.roundManager.currentRound
-          });
-          this.emitEvent('order:created', { order });
+          this.tradeEngine.cancelWorkingOrder(myOrders[0].id, bot.id);
+          this.emitEvent('order:cancelled', { orderId: myOrders[0].id });
         } catch (e) {}
       }
-
-      // 3. Periodically cancel stale bot orders so prices refresh
-      if (Math.random() < 0.3) {
-        const myOrders = this.tradeEngine.getWorkingOrdersForPlayer(randomBot.id);
-        if (myOrders.length > 0 && Date.now() - myOrders[0].createdAt > 12000) {
-          try {
-            this.tradeEngine.cancelWorkingOrder(myOrders[0].id, randomBot.id);
-            this.emitEvent('order:cancelled', { orderId: myOrders[0].id });
-          } catch (e) {}
-        }
-      }
-    }, 2800);
+    }
   }
 
   /**
@@ -381,7 +417,7 @@ export class GameEngine {
    */
   handleGameEnd() {
     this.status = 'FINISHED';
-    if (this.botActivityInterval) clearInterval(this.botActivityInterval);
+    this.stopBotActivityLoop();
 
     // Reveal ALL 6 digits
     const finalDigits = this.digitEngine.getRevealedDigitsForRound(6, true);
@@ -461,7 +497,7 @@ export class GameEngine {
   }
 
   destroy() {
-    if (this.botActivityInterval) clearInterval(this.botActivityInterval);
+    this.stopBotActivityLoop();
     this.roundManager.destroy();
   }
 }
