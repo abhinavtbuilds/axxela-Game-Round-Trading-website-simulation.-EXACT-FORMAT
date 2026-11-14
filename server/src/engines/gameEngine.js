@@ -199,8 +199,8 @@ export class GameEngine {
     if (this.botEngine.isBotDelayed(bot, revealedDigits)) return;
 
     // ── (a) Look for orders to TAKE ──────────────────────────────
-    const openOrders = this.tradeEngine.getAllOpenWorkingOrders()
-      .filter(o => o.playerId !== bot.id);
+    const allTableOrders = this.tradeEngine.getAllOpenWorkingOrders();
+    const openOrders = allTableOrders.filter(o => o.playerId !== bot.id);
     const minEdge = this.botEngine.getMinEdge(bot);
     const noisyEV = this.botEngine.getNoisyEV(bot, revealedDigits);
     const unwinding = this.botEngine.isUnwinding(bot, currentRound);
@@ -233,11 +233,14 @@ export class GameEngine {
     if (bestOrder) {
       try {
         const res = this.tradeEngine.takeWorkingOrder(bestOrder.id, bot.id, bot.letter);
+        console.log(`[BOT ${bot.letter}(${bot.botType})] TOOK ${bestOrder.side} @ ${bestOrder.price} from ${bestOrder.playerLetter} | noisyEV=${noisyEV.toFixed(1)} pos=${currentPosition}`);
         this.broadcastTradeExecution(res);
         return;
       } catch (e) {
-        // Order might have been taken by someone else; continue to quote
+        console.warn(`[BOT ${bot.letter}] FAILED take of ${bestOrder.id}: ${e.message}`);
       }
+    } else if (openOrders.length > 0) {
+      console.log(`[BOT ${bot.letter}(${bot.botType})] SKIPPED ${openOrders.length} open orders | noisyEV=${noisyEV.toFixed(1)} pos=${currentPosition} minEdge=${minEdge}`);
     }
 
     // ── (b) Post a quote if we have room ─────────────────────────
