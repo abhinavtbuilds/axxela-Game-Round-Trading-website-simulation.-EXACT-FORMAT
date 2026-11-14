@@ -136,6 +136,22 @@ export default function App() {
 
     function onTradeExecuted(data) {
       soundManager.playTradeExecuted();
+      // Update local state immediately so the taken order disappears from the table
+      // and positions/PnL reflect the trade without waiting for the next game:sync.
+      setGameState(prev => {
+        if (!prev) return prev;
+        const orderId = data.trade?.orderId;
+        const newOrders = orderId
+          ? (prev.openTableOrders || []).filter(o => o.id !== orderId)
+          : prev.openTableOrders;
+        return {
+          ...prev,
+          openTableOrders: newOrders,
+          myPosition: data.positions?.[prev.myPlayer?.id] ?? prev.myPosition,
+          myRealizedPnL: data.pnl?.[prev.myPlayer?.id] ?? prev.myRealizedPnL,
+          leaderboard: data.leaderboard ?? prev.leaderboard
+        };
+      });
     }
 
     function onSettlement(data) {
@@ -250,15 +266,27 @@ export default function App() {
   };
 
   const handlePlaceWorkingOrder = ({ side, price }) => {
-    socket.emit('order:place', { side, price });
+    socket.emit('order:place', { side, price }, (res) => {
+      if (res && !res.success) {
+        console.warn('[order:place]', res.error);
+      }
+    });
   };
 
   const handleTakeOrder = (orderId) => {
-    socket.emit('order:take', { orderId });
+    socket.emit('order:take', { orderId }, (res) => {
+      if (res && !res.success) {
+        console.warn('[order:take]', res.error);
+      }
+    });
   };
 
   const handleCancelOrder = (orderId) => {
-    socket.emit('order:cancel', { orderId });
+    socket.emit('order:cancel', { orderId }, (res) => {
+      if (res && !res.success) {
+        console.warn('[order:cancel]', res.error);
+      }
+    });
   };
 
   const handleProposeTrade = ({ toPlayerLetter, side, price }) => {
